@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -19,6 +20,10 @@ type Engine struct {
 	queue   *WorkQueue
 	log     *slog.Logger
 	workers int
+	tracker *RetryTracker
+	// defaultBudget 是未在 Spec.RetryBudget 中显式配置时使用的
+	// 默认重试预算；<=0 表示不限次数（保持既有行为）。
+	defaultBudget int
 
 	wg       sync.WaitGroup
 	cancel   context.CancelFunc
@@ -37,7 +42,10 @@ type Config struct {
 	Workers   int
 	BaseDelay time.Duration
 	MaxDelay  time.Duration
-	Clock     Clock
+	// DefaultRetryBudget 是对象的默认自动重试预算（仅统计可恢复失败）。
+	// 对象可用 Spec.RetryBudget 覆盖；<=0 表示不限次数。
+	DefaultRetryBudget int
+	Clock              Clock
 }
 
 // New 构造引擎（尚未启动）。
@@ -66,13 +74,15 @@ func New(cfg Config) *Engine {
 		Log:       cfg.Logger,
 	}
 	return &Engine{
-		rec:      rec,
-		store:    cfg.Store,
-		queue:    NewWorkQueue(),
-		log:      cfg.Logger,
-		workers:  cfg.Workers,
-		inflight: map[object.Key]int{},
-		lastSeen: map[object.Key]int64{},
+		rec:           rec,
+		store:         cfg.Store,
+		queue:         NewWorkQueue(),
+		log:           cfg.Logger,
+		workers:       cfg.Workers,
+		tracker:       newRetryTracker(cfg.BaseDelay, cfg.MaxDelay, cfg.Clock.Now),
+		defaultBudget: cfg.DefaultRetryBudget,
+		inflight:      map[object.Key]int{},
+		lastSeen:      map[object.Key]int64{},
 	}
 }
 
@@ -115,6 +125,9 @@ func (e *Engine) watchNotify(ctx context.Context) {
 			}
 			e.mu.Unlock()
 			if rv > seen || rv == 0 {
+				// 新写入取代了挂起的延迟重试：队列折叠为立即执行，
+				// 视图中的"下一次重试时间"同步清除，保持一致。
+				e.tracker.clearSchedule(k)
 				e.queue.Add(k)
 			}
 		}
@@ -152,10 +165,16 @@ func (e *Engine) worker(ctx context.Context, id int) {
 		}
 		e.mu.Unlock()
 
+		// 该键已被取出执行：上一轮的"挂起重试时间"已被消费，清除，
+		// 避免视图展示一个其实已经在执行的重试计划。
+		e.tracker.clearSchedule(k)
+
 		e.log.Info("worker: reconcile begin",
 			"worker", id, "key", k, "attempt", attempt, "observedRV", rv)
 
 		d := e.rec.ReconcileOnce(ctx, k, attempt-1)
+		// 应用退避/预算策略：失败计数、逐次变长的等待、预算耗尽转放弃。
+		d = e.applyRetryPolicy(k, d)
 
 		// 协调过程中（含引擎自身写入）可能产生了新版本：刷新观测水位。
 		if newRV := e.store.Version(k); newRV > 0 {
@@ -170,13 +189,6 @@ func (e *Engine) worker(ctx context.Context, id int) {
 			e.mu.Unlock()
 		}
 
-		e.mu.Lock()
-		e.inflight[k]--
-		if e.inflight[k] <= 0 {
-			delete(e.inflight, k)
-		}
-		e.mu.Unlock()
-
 		e.log.Info("worker: reconcile end",
 			"worker", id, "key", k, "requeue", d.Requeue,
 			"delay", d.Delay, "terminal", d.Terminal, "reason", d.Reason)
@@ -184,6 +196,9 @@ func (e *Engine) worker(ctx context.Context, id int) {
 		// 先结束本轮：处理期间若有新变更已补排（立即重判最新版本），
 		// 则不再按本轮的旧退避延迟重复入队；否则按判定结果排下一轮。
 		if e.queue.Done(k) {
+			// 补排的立即重判取代了本轮刚排定的延迟重试。
+			e.tracker.clearSchedule(k)
+			e.decInflight(k)
 			continue
 		}
 		if d.Requeue {
@@ -193,7 +208,79 @@ func (e *Engine) worker(ctx context.Context, id int) {
 				e.queue.Add(k)
 			}
 		}
+		// 在"重排队已完成"之后才解除在途标记：WaitIdle 据此不会
+		// 在"协调已结束但下一轮尚未入队"的缝隙里误判为空闲。
+		e.decInflight(k)
 	}
+}
+
+func (e *Engine) decInflight(k object.Key) {
+	e.mu.Lock()
+	e.inflight[k]--
+	if e.inflight[k] <= 0 {
+		delete(e.inflight, k)
+	}
+	e.mu.Unlock()
+}
+
+// applyRetryPolicy 把一轮协调判定映射为引擎侧的退避/预算动作：
+//   - 成功收敛：清零连续失败计数与退避档位；
+//   - 可恢复失败：连续失败计数 +1，等待按档位逐次变长（封顶），
+//     预算耗尽则写入 Abandoned 状态并停止自动重试；
+//   - 冲突重判/等待依赖等非失败重排：只记录排定时间，不计数；
+//   - 终止/放弃：清除挂起的重试计划。
+func (e *Engine) applyRetryPolicy(k object.Key, d Decision) Decision {
+	switch {
+	case d.Gone:
+		e.tracker.remove(k)
+	case d.Converged:
+		e.tracker.recordSuccess(k, d.Generation)
+	case d.Terminal:
+		e.tracker.clearSchedule(k)
+	case d.Requeue && d.Failure && d.Reason == ReasonTransient:
+		budget := e.budgetFor(k)
+		delay, exhausted := e.tracker.recordFailure(k, d.Generation, budget)
+		if exhausted {
+			st, _ := e.tracker.snapshot(k)
+			msg := fmt.Sprintf("retry budget exhausted after %d consecutive failures: %s",
+				st.failures, d.Message)
+			e.rec.MarkAbandoned(k, msg)
+			e.log.Info("engine: retry budget exhausted, object abandoned",
+				"key", k, "failures", st.failures, "budget", budget,
+				"basis", "consecutive transient failures exceeded budget")
+			return Decision{Key: k, Reason: ReasonBudgetExhausted, Message: msg,
+				Generation: d.Generation}
+		}
+		d.Delay = delay
+		if st, ok := e.tracker.snapshot(k); ok {
+			e.log.Info("engine: backoff retry scheduled",
+				"key", k, "consecutiveFailures", st.failures,
+				"delay", delay, "nextRetryAt", st.nextRetryAt,
+				"basis", "transient failure; backoff tier matches failure count")
+		}
+	case d.Requeue && d.Delay > 0:
+		// 非失败性质的延迟重排（如等待依赖清理）：只同步排定时间。
+		e.tracker.noteSchedule(k, d.Delay)
+	}
+	return d
+}
+
+// budgetFor 计算对象的有效重试预算：
+// Spec.RetryBudget > 0 优先；< 0 表示不限；否则用引擎默认（<=0 同样不限）。
+func (e *Engine) budgetFor(k object.Key) int {
+	b := e.defaultBudget
+	if obj, err := e.store.Get(k); err == nil {
+		switch {
+		case obj.Spec.RetryBudget > 0:
+			b = obj.Spec.RetryBudget
+		case obj.Spec.RetryBudget < 0:
+			b = -1
+		}
+	}
+	if b <= 0 {
+		return -1 // 不限次数
+	}
+	return b
 }
 
 // Trigger 请求协调某个键（供外部变更/测试主动触发）。
@@ -202,6 +289,8 @@ func (e *Engine) Trigger(k object.Key) {
 	rv := e.store.Version(k)
 	e.lastSeen[k] = rv
 	e.mu.Unlock()
+	// 新触发取代挂起的延迟重试（队列会把延迟项折叠为立即）。
+	e.tracker.clearSchedule(k)
 	e.queue.Add(k)
 }
 
@@ -216,15 +305,25 @@ func (e *Engine) Stop() {
 }
 
 // WaitIdle 等待队列排空且没有在途协调（便于测试断言）。超时返回 false。
+// 空闲判定：队列无排队/在处理项，且引擎侧无"已取出但尚未完成重排队"
+// 的协调 —— 避免在"协调结束与下一轮入队之间"的缝隙里误判空闲。
 func (e *Engine) WaitIdle(timeout time.Duration) bool {
+	idle := func() bool {
+		if e.queue.Len() != 0 || e.queue.Inflight() != 0 {
+			return false
+		}
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		return len(e.inflight) == 0
+	}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if e.queue.Len() == 0 && e.queue.Inflight() == 0 {
+		if idle() {
 			return true
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	return e.queue.Len() == 0 && e.queue.Inflight() == 0
+	return idle()
 }
 
 // Inflight 返回某键正在协调的次数（正常只可能是 0/1，用于测试"不交叉"）。

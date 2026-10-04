@@ -98,7 +98,19 @@ func (s *Store) Create(obj *object.Object) (*object.Object, error) {
 //   - 否则仅当存储中当前版本 == expectRV 时才提交，新版本自动 +1。
 //
 // 返回提交后的最新对象；版本不符返回 ErrConflict，存储内容不被改动。
+// 成功写入会发出变更通知（供外部写入方触发协调）。
 func (s *Store) CAS(obj *object.Object, expectRV int64) (*object.Object, error) {
+	return s.cas(obj, expectRV, true)
+}
+
+// CASQuiet 与 CAS 相同，但不发出变更通知。
+// 供协调引擎写自身状态使用：引擎对这次写入已有后续调度决定
+// （重排队/结束），无需再经通知通道自我触发一轮冗余重判。
+func (s *Store) CASQuiet(obj *object.Object, expectRV int64) (*object.Object, error) {
+	return s.cas(obj, expectRV, false)
+}
+
+func (s *Store) cas(obj *object.Object, expectRV int64, notify bool) (*object.Object, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cur, ok := s.data[obj.Key]
@@ -111,7 +123,9 @@ func (s *Store) CAS(obj *object.Object, expectRV int64) (*object.Object, error) 
 	stored.ResourceVersion = s.nextRV
 	s.nextRV++
 	s.data[stored.Key] = stored
-	s.signal(stored.Key)
+	if notify {
+		s.signal(stored.Key)
+	}
 	return stored.DeepCopy(), nil
 }
 

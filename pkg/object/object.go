@@ -20,6 +20,9 @@ const (
 	PhaseFailed Phase = "Failed"
 	// PhaseDeleting 正在级联删除。
 	PhaseDeleting Phase = "Deleting"
+	// PhaseAbandoned 重试预算耗尽：已放弃自动重试，需要人工介入。
+	// 只有外部提交新一代 Spec 或运维显式重置才能解除。
+	PhaseAbandoned Phase = "Abandoned"
 )
 
 const (
@@ -43,6 +46,10 @@ type Spec struct {
 	DesiredItems map[string]string
 	// FailConfigured 为 true 时表示配置本身非法（不可恢复失败）。
 	FailConfigured bool
+	// RetryBudget 该对象允许的自动重试次数上限（仅统计可恢复失败）。
+	// 0 表示使用引擎默认预算；负数表示不限次数。
+	// 预算耗尽后对象进入 PhaseAbandoned，不再自动重试。
+	RetryBudget int
 }
 
 // Status 是最近一次成功协调观测到的状态。

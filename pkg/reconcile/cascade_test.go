@@ -16,11 +16,15 @@ type cleanupApplier struct {
 	byChild   sync.Map     // object.Key -> *atomic.Int64
 	failUntil atomic.Int64 // 前 N 次 Cleanup 返回可恢复失败
 	attempts  atomic.Int64
+	delay     atomic.Int64 // 每次 Cleanup 前睡眠的毫秒数（拉大删除/更新竞争窗口）
 }
 
 func (c *cleanupApplier) Apply(_ context.Context, req ApplyRequest) error {
 	if req.Kind != object.EffectCleanup {
 		return nil
+	}
+	if d := c.delay.Load(); d > 0 {
+		time.Sleep(time.Duration(d) * time.Millisecond)
 	}
 	n := c.attempts.Add(1)
 	if v, ok := c.byChild.Load(req.Object); ok {
@@ -140,6 +144,10 @@ func TestCascadeDelete_CleanupRetriableKeepsFinalizer(t *testing.T) {
 // 更新 child。要求：绝不留下无法回收的残留 child；最终全部回收。
 func TestCascadeDelete_RacesWithConcurrentUpdates_NoOrphans(t *testing.T) {
 	clean := &cleanupApplier{}
+	// 给每次 Cleanup 注入 10ms 延迟，保证 child 在删除协调期间
+	// 存活足够久，使并发更新方必然能打出"合法更新 + 陈旧强写"，
+	// 否则子对象可能在更新方首次循环前就被回收，竞争窗口消失。
+	clean.delay.Store(10)
 	owner := readyOwner("owner-3")
 	seed := []*object.Object{owner}
 	for i := 0; i < 6; i++ {

@@ -49,6 +49,17 @@ type Decision struct {
 	Terminal bool          // 是否为不可恢复失败（终止重试）
 	Reason   FailureReason
 	Message  string
+	// Failure 表示本轮发生了真实的可恢复失败（计入连续失败与重试预算）；
+	// 冲突重判、等待依赖清理等"非失败"重排队不计入。
+	Failure bool
+	// Converged 表示本轮已收敛到确定结果（成功/清理完成），
+	// 引擎据此清零连续失败计数与退避档位。
+	Converged bool
+	// Gone 表示对象已不存在。
+	Gone bool
+	// Generation 是本轮判定所依据的 Spec.Generation（引擎据此检测
+	// "外部提交了新一代配置"，从而重置退避状态）。
+	Generation int64
 }
 
 // 状态机三个终向：重排队（延迟）、终止、本轮结束（无需再排队）。
@@ -59,6 +70,7 @@ func retryDecision(key object.Key, r FailureReason, msg string, attempt int, bas
 		Delay:   Backoff(base, max, attempt),
 		Reason:  r,
 		Message: msg,
+		Failure: r == ReasonTransient,
 	}
 }
 
@@ -67,7 +79,11 @@ func terminalDecision(key object.Key, msg string) Decision {
 }
 
 func doneDecision(key object.Key) Decision {
-	return Decision{Key: key}
+	return Decision{Key: key, Converged: true}
+}
+
+func goneDecision(key object.Key) Decision {
+	return Decision{Key: key, Gone: true}
 }
 
 // ReconcileOnce 读取最新版本并执行一轮协调。
@@ -78,7 +94,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context, key object.Key, attempt 
 		if errors.Is(err, store.ErrNotFound) {
 			// 对象已不存在（可能已被物理回收）：无需任何动作。
 			r.Log.Info("reconcile: object gone, nothing to do", "key", key, "attempt", attempt)
-			return doneDecision(key)
+			return goneDecision(key)
 		}
 		// 存储读失败视为可恢复，立即重试。
 		return retryDecision(key, ReasonTransient, err.Error(), 0, r.BaseDelay, r.MaxDelay)
@@ -94,10 +110,15 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context, key object.Key, attempt 
 		"attempt", attempt,
 	)
 
+	var d Decision
 	if obj.Deleting() {
-		return r.reconcileDelete(ctx, obj, attempt)
+		d = r.reconcileDelete(ctx, obj, attempt)
+	} else {
+		d = r.reconcileUpsert(ctx, obj, attempt)
 	}
-	return r.reconcileUpsert(ctx, obj, attempt)
+	// 标注本轮判定所依据的期望配置代际，供引擎检测"新一代 Spec"。
+	d.Generation = obj.Spec.Generation
+	return d
 }
 
 // reconcileUpsert 处理存活路径：
@@ -118,7 +139,7 @@ func (r *Reconciler) reconcileUpsert(ctx context.Context, obj *object.Object, at
 	if !obj.HasFinalizer(object.FinalizerOwnerCleanup) {
 		next := obj.DeepCopy()
 		next.AddFinalizer(object.FinalizerOwnerCleanup)
-		stored, err := r.Store.CAS(next, rv)
+		stored, err := r.Store.CASQuiet(next, rv)
 		if err != nil {
 			return r.onCASConflict(key, rv, err, attempt, "add finalizer")
 		}
@@ -130,6 +151,15 @@ func (r *Reconciler) reconcileUpsert(ctx context.Context, obj *object.Object, at
 	}
 
 	// --- b. 配置校验：不可恢复失败 ---
+	// 预算耗尽粘滞：已放弃的对象不再自动重试、不再改写状态，
+	// 直到外部提交新一代 Spec 或运维显式重置（ClearAbandoned）。
+	if obj.Status.Phase == object.PhaseAbandoned &&
+		obj.Status.ObservedGeneration == obj.Spec.Generation {
+		r.Log.Info("reconcile: abandoned, waiting for manual intervention",
+			"key", key, "observedRV", rv, "generation", obj.Spec.Generation,
+			"basis", "retry budget exhausted for current generation")
+		return Decision{Key: key, Reason: ReasonBudgetExhausted, Message: obj.Status.Reason}
+	}
 	// 终结失败粘滞：针对同一代 Spec 已下过不可恢复结论时，
 	// 不再重新下发副作用、不再改写状态；直到外部提交新一代 Spec。
 	if obj.Status.Phase == object.PhaseFailed && !obj.Status.Retriable &&
@@ -238,6 +268,7 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, obj *object.Object, at
 		"basis", "deletionTimestamp set")
 
 	blocked := false
+	cleanupFailed := false
 	for _, child := range children {
 		crv := child.ResourceVersion
 		// child 若也处于删除中，仍需确保其外部资源被回收。
@@ -259,6 +290,7 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, obj *object.Object, at
 			r.Log.Info("reconcile: child cleanup failed, retry",
 				"key", key, "child", child.Key, "reason", reason, "err", err.Error())
 			blocked = true
+			cleanupFailed = true
 			continue
 		}
 		if err := r.Store.Delete(child.Key, crv); err != nil {
@@ -283,10 +315,14 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, obj *object.Object, at
 		next.Status.Phase = object.PhaseDeleting
 		next.Status.Reason = "waiting for children cleanup"
 		next.Status.Retriable = true
-		if _, err := r.Store.CAS(next, rv); err != nil {
+		if _, err := r.Store.CASQuiet(next, rv); err != nil {
 			return r.onCASConflict(key, rv, err, attempt, "mark deleting")
 		}
-		return retryDecision(key, ReasonTransient, "children remain", attempt, r.BaseDelay, r.MaxDelay)
+		d := retryDecision(key, ReasonTransient, "children remain", attempt, r.BaseDelay, r.MaxDelay)
+		// 仅"清理副作用失败"计入连续失败与重试预算；
+		// 单纯等待依赖清理属于非失败性质的延迟重排。
+		d.Failure = cleanupFailed
+		return d
 	}
 
 	// 所有 child 已回收：摘除 finalizer。
@@ -300,7 +336,7 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, obj *object.Object, at
 	next.Status.Phase = object.PhaseDeleting
 	next.Status.Reason = ""
 	next.Status.Retriable = false
-	stored, err := r.Store.CAS(next, rv)
+	stored, err := r.Store.CASQuiet(next, rv)
 	if err != nil {
 		return r.onCASConflict(key, rv, err, attempt, "remove finalizer")
 	}
@@ -322,7 +358,7 @@ func (r *Reconciler) writeFailure(obj *object.Object, rv int64, reason FailureRe
 	next.Status.UpdatedAt = now
 	next.Status.ObservedGeneration = obj.Spec.Generation
 	// 关键：不清空 ReadyItems，保留上次成功写入的状态。
-	stored, err := r.Store.CAS(next, rv)
+	stored, err := r.Store.CASQuiet(next, rv)
 	if err != nil {
 		d := r.onCASConflict(obj.Key, rv, err, attempt, "write failure status")
 		return &d
@@ -345,7 +381,7 @@ func (r *Reconciler) writeProgress(obj *object.Object, rv int64, ready map[strin
 	next.Status.Attempts = attempt + 1
 	next.Status.UpdatedAt = now
 	next.Status.ObservedGeneration = obj.Spec.Generation
-	stored, err := r.Store.CAS(next, rv)
+	stored, err := r.Store.CASQuiet(next, rv)
 	if err != nil {
 		d := r.onCASConflict(obj.Key, rv, err, attempt, "write progress")
 		return &d
@@ -368,6 +404,61 @@ func (r *Reconciler) onCASConflict(key object.Key, staleRV int64, err error, att
 	r.Log.Info("reconcile: store write error, retry",
 		"key", key, "op", op, "err", err.Error())
 	return retryDecision(key, ReasonTransient, err.Error(), attempt, r.BaseDelay, r.MaxDelay)
+}
+
+// MarkAbandoned 把对象写入"已放弃、需要人工介入"状态（重试预算耗尽）。
+// 幂等；CAS 冲突时放弃本次写入 —— 冲突产生的新版本会触发重判，
+// 届时预算仍然耗尽，会再次尝试写入。
+func (r *Reconciler) MarkAbandoned(key object.Key, msg string) {
+	obj, err := r.Store.Get(key)
+	if err != nil {
+		return
+	}
+	if obj.Status.Phase == object.PhaseAbandoned &&
+		obj.Status.ObservedGeneration == obj.Spec.Generation {
+		return // 已是放弃状态
+	}
+	next := obj.DeepCopy()
+	next.Status.Phase = object.PhaseAbandoned
+	next.Status.Reason = msg
+	next.Status.Retriable = false
+	next.Status.UpdatedAt = r.Clock.Now().UTC().Format(time.RFC3339Nano)
+	next.Status.ObservedGeneration = obj.Spec.Generation
+	stored, err := r.Store.CASQuiet(next, obj.ResourceVersion)
+	if err != nil {
+		r.Log.Info("reconcile: mark abandoned conflict, next judgement will retry",
+			"key", key, "staleRV", obj.ResourceVersion)
+		return
+	}
+	r.Log.Info("reconcile: retry budget exhausted, abandoned",
+		"key", key, "observedRV", obj.ResourceVersion, "newRV", stored.ResourceVersion,
+		"basis", msg)
+}
+
+// ClearAbandoned 运维显式重置时清除 Abandoned 状态（若仍处于该状态），
+// 使对象可以重新从最小退避等待开始自动收敛。
+func (r *Reconciler) ClearAbandoned(key object.Key) {
+	obj, err := r.Store.Get(key)
+	if err != nil {
+		return
+	}
+	if obj.Status.Phase != object.PhaseAbandoned {
+		return
+	}
+	next := obj.DeepCopy()
+	next.Status.Phase = object.PhasePending
+	next.Status.Reason = ""
+	next.Status.Retriable = false
+	next.Status.UpdatedAt = r.Clock.Now().UTC().Format(time.RFC3339Nano)
+	stored, err := r.Store.CASQuiet(next, obj.ResourceVersion)
+	if err != nil {
+		r.Log.Info("reconcile: clear abandoned conflict, caller should retry reset",
+			"key", key, "staleRV", obj.ResourceVersion)
+		return
+	}
+	r.Log.Info("reconcile: abandoned state cleared by operator reset",
+		"key", key, "observedRV", obj.ResourceVersion, "newRV", stored.ResourceVersion,
+		"basis", "explicit ResetRetry")
 }
 
 func equalMaps(a, b map[string]string) bool {

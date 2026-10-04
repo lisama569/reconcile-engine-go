@@ -19,6 +19,9 @@ const (
 	ReasonConfig FailureReason = "InvalidConfig"
 	// ReasonConflict 协调期间版本被他人改写：立即用最新版本重新判定。
 	ReasonConflict FailureReason = "Conflict"
+	// ReasonBudgetExhausted 可恢复失败的自动重试预算已耗尽：
+	// 对象进入"已放弃、需要人工介入"状态，不再自动重试。
+	ReasonBudgetExhausted FailureReason = "RetryBudgetExhausted"
 )
 
 // ErrInvalidConfig 是不可恢复配置错误的哨兵错误，可用 errors.Is 判断。
