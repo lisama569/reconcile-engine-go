@@ -39,6 +39,25 @@ type Reconciler struct {
 	BaseDelay time.Duration
 	MaxDelay  time.Duration
 	Log       *slog.Logger
+	// Tracker 记录每对象连续失败次数；退避档位由它决定，
+	// 与队列出队次数无关，因此重新触发/重新排队不会回到最短等待。
+	Tracker *retryTracker
+	// DefaultBudget 是全局默认重试预算（连续可恢复失败次数上限，
+	// 超过即放弃并等待人工介入）；<=0 表示不限。
+	// 对象可用 Spec.RetryBudget 覆盖（负数表示该对象不限）。
+	DefaultBudget int
+	// SelfWrites 记录本协调器写入的版本，供引擎 watcher 区分
+	// 自写通知与外部变更（为 nil 时退化为直接写 Store）。
+	SelfWrites *selfWriteLog
+}
+
+// cas 执行 CAS 并把成功写入的版本登记到自写日志。
+func (r *Reconciler) cas(obj *object.Object, expectRV int64) (*object.Object, error) {
+	stored, err := r.Store.CAS(obj, expectRV)
+	if err == nil && r.SelfWrites != nil {
+		r.SelfWrites.add(obj.Key, stored.ResourceVersion)
+	}
+	return stored, err
 }
 
 // Decision 是一次协调的判定结果。
@@ -70,13 +89,54 @@ func doneDecision(key object.Key) Decision {
 	return Decision{Key: key}
 }
 
+// --- 连续失败计数与重试预算（Tracker 为 nil 时退化为旧行为：按入参 attempt 退避）---
+
+// failuresFor 返回该对象当前代配置下已记录的连续失败次数。
+func (r *Reconciler) failuresFor(key object.Key, generation int64) int {
+	if r.Tracker == nil {
+		return 0
+	}
+	return r.Tracker.countFor(key, generation)
+}
+
+// noteFailure 记录一次连续失败，返回新的连续失败次数（即当前退避档位基数）。
+func (r *Reconciler) noteFailure(key object.Key, reason FailureReason, generation int64) int {
+	if r.Tracker == nil {
+		return 1
+	}
+	return r.Tracker.recordFailure(key, reason, generation)
+}
+
+// noteSuccess 成功收敛后清零连续失败计数，退避回到最小等待。
+func (r *Reconciler) noteSuccess(key object.Key) {
+	if r.Tracker == nil {
+		return
+	}
+	r.Tracker.recordSuccess(key)
+}
+
+// budgetFor 计算该对象的有效重试预算：Spec.RetryBudget 优先，
+// 为 0 时用引擎默认；最终结果 <=0 表示不限。
+func (r *Reconciler) budgetFor(obj *object.Object) int {
+	if obj.Spec.RetryBudget != 0 {
+		return obj.Spec.RetryBudget
+	}
+	return r.DefaultBudget
+}
+
+// budgetExceeded 判断连续失败次数是否已超出预算。
+func budgetExceeded(budget, consecutiveFailures int) bool {
+	return budget > 0 && consecutiveFailures > budget
+}
+
 // ReconcileOnce 读取最新版本并执行一轮协调。
 func (r *Reconciler) ReconcileOnce(ctx context.Context, key object.Key, attempt int) Decision {
 	// 1) 永远以 Store 中的最新版本为输入，不使用调用方可能持有的过期快照。
 	obj, err := r.Store.Get(key)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			// 对象已不存在（可能已被物理回收）：无需任何动作。
+			// 对象已不存在（可能已被物理回收）：无需任何动作，清理失败计数。
+			r.noteSuccess(key)
 			r.Log.Info("reconcile: object gone, nothing to do", "key", key, "attempt", attempt)
 			return doneDecision(key)
 		}
@@ -118,7 +178,7 @@ func (r *Reconciler) reconcileUpsert(ctx context.Context, obj *object.Object, at
 	if !obj.HasFinalizer(object.FinalizerOwnerCleanup) {
 		next := obj.DeepCopy()
 		next.AddFinalizer(object.FinalizerOwnerCleanup)
-		stored, err := r.Store.CAS(next, rv)
+		stored, err := r.cas(next, rv)
 		if err != nil {
 			return r.onCASConflict(key, rv, err, attempt, "add finalizer")
 		}
@@ -130,17 +190,24 @@ func (r *Reconciler) reconcileUpsert(ctx context.Context, obj *object.Object, at
 	}
 
 	// --- b. 配置校验：不可恢复失败 ---
-	// 终结失败粘滞：针对同一代 Spec 已下过不可恢复结论时，
-	// 不再重新下发副作用、不再改写状态；直到外部提交新一代 Spec。
+	// 终结失败粘滞：针对同一代 Spec 已下过不可恢复结论时（配置非法或
+	// 重试预算耗尽），不再重新下发副作用、不再改写状态；
+	// 直到外部提交新一代 Spec 或运维显式重置（Reset 会清掉失败标记）。
 	if obj.Status.Phase == object.PhaseFailed && !obj.Status.Retriable &&
 		obj.Status.ObservedGeneration == obj.Spec.Generation && obj.Status.Reason != "" {
-		r.Log.Info("reconcile: terminal failure sticky, skip until spec changes",
+		reason := FailureReason(obj.Status.FailureKind)
+		if reason == "" {
+			reason = ReasonConfig
+		}
+		r.Log.Info("reconcile: terminal failure sticky, skip until spec changes or reset",
 			"key", key, "observedRV", rv, "generation", obj.Spec.Generation,
+			"failureKind", reason,
 			"basis", "non-retriable failure for current generation")
-		return terminalDecision(key, obj.Status.Reason)
+		return Decision{Key: key, Terminal: true, Reason: reason, Message: obj.Status.Reason}
 	}
 	if obj.Spec.FailConfigured {
 		msg := "desired spec is invalid: FailConfigured=true"
+		r.noteFailure(key, ReasonConfig, obj.Spec.Generation)
 		// 失败状态同样走 CAS；冲突则下一轮以最新版本重判（也许配置已被修正）。
 		if d := r.writeFailure(obj, rv, ReasonConfig, msg, false, attempt, now); d != nil {
 			return *d
@@ -178,6 +245,7 @@ func (r *Reconciler) reconcileUpsert(ctx context.Context, obj *object.Object, at
 			if reason == ReasonConfig {
 				// 单个配置错误立即终止该对象；保留此前已成功项。
 				msg := fmt.Sprintf("item %q invalid config: %v", token, err)
+				r.noteFailure(key, ReasonConfig, obj.Spec.Generation)
 				if d := r.writeFailure(obj, rv, ReasonConfig, msg, false, attempt, now); d != nil {
 					return *d
 				}
@@ -196,17 +264,31 @@ func (r *Reconciler) reconcileUpsert(ctx context.Context, obj *object.Object, at
 	// --- d/e. 写回观测状态 ---
 	if firstErr != nil {
 		msg := firstErr.Error()
+		// 连续失败计数 +1；退避档位由计数决定（count-1 为 Backoff 的 attempt），
+		// 与是否被重新触发/重新排队无关，因此等待时间逐次变长直到封顶。
+		count := r.noteFailure(key, firstReason, obj.Spec.Generation)
+		if budgetExceeded(r.budgetFor(obj), count) {
+			giveMsg := fmt.Sprintf("retry budget exhausted after %d consecutive failures: %s", count, msg)
+			if d := r.writeFailure(obj, rv, ReasonBudgetExhausted, giveMsg, false, attempt, now); d != nil {
+				return *d
+			}
+			r.Log.Info("reconcile: retry budget exhausted, give up until new spec or manual reset",
+				"key", key, "observedRV", rv, "consecutiveFailures", count,
+				"budget", r.budgetFor(obj), "basis", "consecutive transient failures over budget")
+			return Decision{Key: key, Terminal: true, Reason: ReasonBudgetExhausted, Message: giveMsg}
+		}
 		d := r.writeProgress(obj, rv, ready, object.PhaseFailed, true, firstReason, msg, attempt, now,
 			"retryable failure; keeping last-ready items")
 		if d != nil {
 			return *d
 		}
-		return retryDecision(key, firstReason, msg, attempt, r.BaseDelay, r.MaxDelay)
+		return retryDecision(key, firstReason, msg, count-1, r.BaseDelay, r.MaxDelay)
 	}
 
 	// 全部成功：仅当"内容确实变化"或"阶段不是 Ready"时才写入，
 	// 杜绝已收敛对象被反复改写、版本被反复递增。
 	if obj.Status.Phase == object.PhaseReady && equalMaps(obj.Status.ReadyItems, ready) && obj.Status.Reason == "" {
+		r.noteSuccess(key)
 		r.Log.Info("reconcile: already converged, no write",
 			"key", key, "observedRV", rv, "basis", "status==ready and readyItems unchanged")
 		return doneDecision(key)
@@ -217,6 +299,7 @@ func (r *Reconciler) reconcileUpsert(ctx context.Context, obj *object.Object, at
 	if d != nil {
 		return *d
 	}
+	r.noteSuccess(key)
 	return doneDecision(key)
 }
 
@@ -232,12 +315,22 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, obj *object.Object, at
 	key := obj.Key
 	rv := obj.ResourceVersion
 
+	// 删除路径上的"预算耗尽放弃"同样粘滞：保留 finalizer、不再自动重试，
+	// 直到运维显式重置（Reset 清除失败标记并重新入队）。
+	if obj.Status.FailureKind == string(ReasonBudgetExhausted) && !obj.Status.Retriable {
+		r.Log.Info("reconcile: delete give-up sticky, waiting for manual reset",
+			"key", key, "observedRV", rv, "basis", "budget exhausted while deleting")
+		return Decision{Key: key, Terminal: true, Reason: ReasonBudgetExhausted, Message: obj.Status.Reason}
+	}
+
 	children := r.Store.ListChildren(key)
 	r.Log.Info("reconcile: delete path",
 		"key", key, "observedRV", rv, "children", len(children),
 		"basis", "deletionTimestamp set")
 
 	blocked := false
+	cleanupFailed := false
+	var firstErr error
 	for _, child := range children {
 		crv := child.ResourceVersion
 		// child 若也处于删除中，仍需确保其外部资源被回收。
@@ -259,6 +352,10 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, obj *object.Object, at
 			r.Log.Info("reconcile: child cleanup failed, retry",
 				"key", key, "child", child.Key, "reason", reason, "err", err.Error())
 			blocked = true
+			cleanupFailed = true
+			if firstErr == nil {
+				firstErr = err
+			}
 			continue
 		}
 		if err := r.Store.Delete(child.Key, crv); err != nil {
@@ -278,19 +375,45 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, obj *object.Object, at
 	}
 
 	if blocked || len(r.Store.ListChildren(key)) > 0 {
+		// 只有"清理副作用真的失败"才计入连续失败并消耗重试预算；
+		// 单纯的版本冲突/新 child 出现属于并发竞争，立即重判、不计失败。
+		count := 0
+		if cleanupFailed {
+			count = r.noteFailure(key, ReasonTransient, obj.Spec.Generation)
+		}
+		giveUp := cleanupFailed && budgetExceeded(r.budgetFor(obj), count)
+
 		// 标记删除中阶段（CAS），失败则立即重判。
 		next := obj.DeepCopy()
 		next.Status.Phase = object.PhaseDeleting
-		next.Status.Reason = "waiting for children cleanup"
-		next.Status.Retriable = true
-		if _, err := r.Store.CAS(next, rv); err != nil {
+		next.Status.Retriable = !giveUp
+		if giveUp {
+			next.Status.Reason = fmt.Sprintf(
+				"retry budget exhausted after %d consecutive cleanup failures: %v", count, firstErr)
+			next.Status.FailureKind = string(ReasonBudgetExhausted)
+		} else {
+			next.Status.Reason = "waiting for children cleanup"
+			next.Status.FailureKind = ""
+		}
+		if _, err := r.cas(next, rv); err != nil {
 			return r.onCASConflict(key, rv, err, attempt, "mark deleting")
 		}
-		return retryDecision(key, ReasonTransient, "children remain", attempt, r.BaseDelay, r.MaxDelay)
+		if giveUp {
+			r.Log.Info("reconcile: cleanup retry budget exhausted, keep finalizer and wait for manual reset",
+				"key", key, "observedRV", rv, "consecutiveFailures", count,
+				"budget", r.budgetFor(obj))
+			return Decision{Key: key, Terminal: true, Reason: ReasonBudgetExhausted, Message: next.Status.Reason}
+		}
+		if cleanupFailed {
+			return retryDecision(key, ReasonTransient, firstErr.Error(), count-1, r.BaseDelay, r.MaxDelay)
+		}
+		return Decision{Key: key, Requeue: true, Delay: 0, Reason: ReasonConflict,
+			Message: "children remain"}
 	}
 
 	// 所有 child 已回收：摘除 finalizer。
 	if !obj.HasFinalizer(object.FinalizerOwnerCleanup) {
+		r.noteSuccess(key)
 		r.Log.Info("reconcile: children empty and finalizer already gone",
 			"key", key, "observedRV", rv, "basis", "cleanup confirmed")
 		return doneDecision(key)
@@ -299,11 +422,13 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, obj *object.Object, at
 	next.RemoveFinalizer(object.FinalizerOwnerCleanup)
 	next.Status.Phase = object.PhaseDeleting
 	next.Status.Reason = ""
+	next.Status.FailureKind = ""
 	next.Status.Retriable = false
-	stored, err := r.Store.CAS(next, rv)
+	stored, err := r.cas(next, rv)
 	if err != nil {
 		return r.onCASConflict(key, rv, err, attempt, "remove finalizer")
 	}
+	r.noteSuccess(key)
 	r.Log.Info("reconcile: finalizer removed after cleanup confirmed",
 		"key", key, "observedRV", rv, "newRV", stored.ResourceVersion,
 		"basis", "all children reclaimed")
@@ -317,12 +442,13 @@ func (r *Reconciler) writeFailure(obj *object.Object, rv int64, reason FailureRe
 	next := obj.DeepCopy()
 	next.Status.Phase = object.PhaseFailed
 	next.Status.Reason = msg
+	next.Status.FailureKind = string(reason)
 	next.Status.Retriable = retriable
 	next.Status.Attempts = attempt + 1
 	next.Status.UpdatedAt = now
 	next.Status.ObservedGeneration = obj.Spec.Generation
 	// 关键：不清空 ReadyItems，保留上次成功写入的状态。
-	stored, err := r.Store.CAS(next, rv)
+	stored, err := r.cas(next, rv)
 	if err != nil {
 		d := r.onCASConflict(obj.Key, rv, err, attempt, "write failure status")
 		return &d
@@ -341,11 +467,12 @@ func (r *Reconciler) writeProgress(obj *object.Object, rv int64, ready map[strin
 	next.Status.Phase = phase
 	next.Status.ReadyItems = ready
 	next.Status.Reason = msg
+	next.Status.FailureKind = string(reason)
 	next.Status.Retriable = retriable
 	next.Status.Attempts = attempt + 1
 	next.Status.UpdatedAt = now
 	next.Status.ObservedGeneration = obj.Spec.Generation
-	stored, err := r.Store.CAS(next, rv)
+	stored, err := r.cas(next, rv)
 	if err != nil {
 		d := r.onCASConflict(obj.Key, rv, err, attempt, "write progress")
 		return &d

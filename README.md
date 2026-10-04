@@ -7,6 +7,10 @@
 - 协调中版本变化以最新版本重新判定，过期快照不能覆盖较新状态；
 - 可恢复失败指数退避重试并保留上次成功状态；不可恢复失败终止重试并给出
   可区分的失败原因；单个对象失败不阻塞其他对象；
+- 每对象重试预算：连续失败逐次变长直到封顶，预算耗尽进入"已放弃、需人工
+  介入"状态，新配置或显式重置才解除；
+- 运行时收敛视图：按对象只读查询阶段、已完成项、失败分类、连续失败次数、
+  下一次重试时间与依赖清理等待，查询无副作用、与最新状态一致；
 - 终结器（finalizer）级联删除：先回收全部派生对象（children），再摘除
   所有者的清理终结器；删除/更新并发下不留残留；
 - 不同对象并行协调，同一对象任意时刻最多一个协调在执行（不交叉）。
@@ -77,11 +81,83 @@ eng.Trigger("svc")
 | `store.ErrConflict`            | **Conflict**  | 延迟 0，立即以最新版本重新判定         |
 | `reconcile.Transient(err)`     | **Transient** | 指数退避 `base·2^attempt`（封顶 max）  |
 | `reconcile.InvalidConfig(...)` | **InvalidConfig** | 写原因后终止，不再重试/改写        |
+| 连续失败超预算                 | **BudgetExhausted** | 放弃自动重试，等待人工介入       |
 | 其他未知错误                   | Transient     | 保守地按可恢复处理                     |
 
 - 退避默认 `10ms` 起步、`200ms` 封顶（无随机抖动，测试结果可复现）；
 - 重试时只重放**尚未 Ready** 的项；已成功项绝不重放（重复协调无重复副作用）；
 - 若协调处理期间又收到新变更，新变更优先（立即重判），旧的退避调度作废。
+
+### 退避档位与连续失败计数
+
+- 退避档位由**每对象连续失败计数器**（`retryTracker`）驱动，与队列出队次数
+  无关：第 n 次连续失败的等待为 `Backoff(base, max, n-1)`，即
+  `base, 2·base, 4·base, …` 直到封顶 `max`；
+- 中途被 `Trigger`/外部写入**重新触发或重新排队不会回到最短等待**——
+  计数器不清零，触发只会立即补一次重判，之后的等待仍按当前档位继续；
+- 计数器在以下情况清零：协调成功收敛、外部提交**新一代 Spec**
+  （`Spec.Generation` 变化）、运维显式 `Engine.Reset`；
+- 引擎自己写状态产生的变更通知会被自写日志（`selfWriteLog`）过滤，
+  不会把刚排好的退避等待折叠成立即重判（否则退避会被自写抖动破坏）。
+
+### 重试预算与"已放弃"状态
+
+- 每个对象可通过 `Spec.RetryBudget` 配置预算（允许的最大连续可恢复失败
+  次数）；为 0 时使用引擎级 `Config.DefaultRetryBudget`；两者都 <=0 表示
+  不限；`Spec.RetryBudget` 为负数表示该对象显式不限；
+- 连续失败次数**超过**预算时（如预算 2 → 第 3 次连续失败），对象进入
+  **已放弃、需人工介入**状态：`Phase=Failed`、`Retriable=false`、
+  `FailureKind=BudgetExhausted`，不再自动重试、不再改写版本；
+  删除路径上清理反复失败同样会耗尽预算——此时**保留 finalizer**、
+  child 原地保留，等待人工处理；
+- 放弃状态是粘滞的：外部系统恢复也不会自动解除。只有两种解除方式：
+  1. 外部提交**新一代 Spec**（`Generation` 递增）；
+  2. 运维调用 **`Engine.Reset(key)`**：清除失败标记、清零连续失败计数、
+     立即重新入队，从最小等待重新开始；
+- 放弃只影响该对象自身，其他对象照常收敛/重试；
+- 配置性失败（`InvalidConfig`）不消耗预算：第一次发生即终止，
+  `FailureKind=InvalidConfig`，与预算耗尽在视图中明确可区分。
+
+## 运行时收敛视图
+
+`Engine.View(key)` 返回某对象当前时刻的 `ConvergenceView` 快照：
+
+| 字段                    | 含义                                                   |
+| ----------------------- | ------------------------------------------------------ |
+| `Exists`                | 对象是否仍存在（可能已被物理回收）                     |
+| `Phase` / `ReadyItems`  | 当前阶段 / 已确认完成的目标项                          |
+| `LastFailureKind`       | 最近失败分类：Transient / InvalidConfig / BudgetExhausted |
+| `LastFailureRetriable`  | 最近失败是否可恢复                                     |
+| `ConsecutiveFailures`   | 同一原因连续失败次数（当前代配置）                     |
+| `NextRetryAt` / `RetryScheduled` | 下一次重试的计划时间 / 是否有重试在排队        |
+| `GaveUp`                | 预算耗尽、已放弃、需人工介入                           |
+| `Deleting` / `WaitingOnChildren` | 是否删除中 / 是否在等依赖 child 清理完         |
+
+一致性与无副作用保证：
+
+- 查询为**纯只读**：不阻塞协调、不产生副作用、不递增任何版本；
+- `NextRetryAt` 直接读工作队列的排队项（唯一事实来源）：被新写入取消或
+  提前的重试**不会**残留在视图里；
+- 状态字段来自 Store 当前最新版本，与协调器判定所用的是同一份数据。
+
+`Engine.Reset(key)` 是配套的运维操作：解除"已放弃/终结失败"粘滞、清零
+退避档位并立即重新入队；对其他对象无影响。
+
+## 批量混合负载下的最终态保证
+
+`TestBatch_MixedLoadDeterministic` 演练 280 个对象的混合负载
+（普通收敛 / 持续被更新 / 反复重试后恢复 / 永久失败超预算 / 配置非法 /
+级联删除，worker 仅 3 个），保证：
+
+- **每个对象都收敛到确定结果**：Ready、BudgetExhausted（放弃）、
+  InvalidConfig（终止）、Deleting（finalizer 已摘除）之一，无对象卡死
+  或永远排不上队（队列按 readyAt 公平取用）；
+- **该回收的依赖对象一个不剩**：所有 child 物理删除，每个 child 的
+  Cleanup 副作用恰好下发一次；
+- **更新与删除交错不死锁**：持续心跳更新只推迟、不阻止最终回收；
+- **收敛后系统静止**：不再有无谓的版本递增或副作用调用；
+- **结果可复现**：同一场景连跑两遍，逐对象终态与每次副作用调用的
+  指纹完全一致（配合 `-count=N` 可反复验证）。
 
 ## 冲突规则（乐观并发控制）
 
@@ -115,6 +191,20 @@ owner 对象持有 finalizer `owner-cleanup`。当其 `DeletionTimestamp` 非空
   只影响自身队列，不影响其他 worker 上的对象；
 - `Store.Notify()` 让外部写入（含并发改写）自动触发对应对象重判。
 
+## 兼容范围
+
+本次扩展对现有调用方完全向后兼容：
+
+- 不设置 `Config.DefaultRetryBudget` 且对象不带 `Spec.RetryBudget` 时，
+  重试**不限次数**（预算 <=0 的默认语义），原有失败分类、终结粘滞、
+  级联删除行为不变；
+- `Spec.RetryBudget` / `Status.FailureKind` 为新增字段，零值语义与旧行为
+  一致（不限预算 / 无失败分类）；
+- `Engine.View` / `Engine.Reset` 为新增只读/运维 API，不影响既有
+  `Trigger`/`Start`/`Stop`/`WaitIdle` 调用路径；
+- 唯一的行为收紧：引擎自写不再触发额外重判（消除了自写抖动引起的
+  多余协调轮次），对外部写入的自动重判逻辑不变。
+
 ## 验证方法
 
 ```bash
@@ -141,6 +231,16 @@ go test ./pkg/reconcile/ -v   # 查看每轮输入/观测版本/判定依据日�
 | 删除/更新并发不留残留        | `TestCascadeDelete_RacesWithConcurrentUpdates_NoOrphans`       |
 | 同键串行、异键并行           | `TestWorkQueueNoCrossConcurrency`、`TestParallel_DifferentKeysConcurrentSameKeySerial` |
 | 新一代 Spec 解除终结粘滞     | `TestTerminalFailure_RecoversAfterNewGeneration`               |
+| 收敛视图：已收敛/失败中/删除中 | `TestView_ConvergedObject`、`TestView_FailingObjectShowsRetryState`、`TestView_DeletingWaitsOnChildren` |
+| 视图查询无副作用             | `TestView_QueryHasNoSideEffects`（并发查询不改版本、零副作用） |
+| 视图重试计划与最新状态一致   | `TestView_RetryPlanConsistentAfterNewWrite`（新写入取消旧重试） |
+| 退避逐次变长直到封顶         | `TestRetry_DelayEscalatesUntilCapped`（相邻重试间隔严格变长、触发不重置） |
+| 预算耗尽放弃、人工重置解除   | `TestRetryBudget_GiveUpNeedsManualIntervention`                |
+| 新配置解除放弃态             | `TestRetryBudget_NewGenerationReleases`                        |
+| 配置失败不消耗预算、仍即停   | `TestRetryBudget_ConfigFailureStillTerminalImmediately`        |
+| 删除路径预算耗尽与重置       | `TestRetryBudget_DeletePathGiveUpAndReset`                     |
+| 批量混合负载终态确定、可复现 | `TestBatch_MixedLoadDeterministic`（280 对象、两次运行指纹一致） |
 
 所有断言均针对**可观测事实**：副作用调用次数（`CountingApplier`）、
-最终 Status/Phase、`ResourceVersion` 是否变化、child 是否全部消失。
+相邻两次重试的真实间隔、最终 Status/Phase、`ResourceVersion` 是否变化、
+child 是否全部消失、两次批量运行的指纹是否一致。

@@ -43,6 +43,10 @@ type Spec struct {
 	DesiredItems map[string]string
 	// FailConfigured 为 true 时表示配置本身非法（不可恢复失败）。
 	FailConfigured bool
+	// RetryBudget 是该对象允许的最大连续可恢复失败次数：
+	// 超过后进入"已放弃、需人工介入"状态，不再自动重试。
+	// 0 表示使用引擎默认预算；负数表示不限。
+	RetryBudget int
 }
 
 // Status 是最近一次成功协调观测到的状态。
@@ -51,9 +55,13 @@ type Status struct {
 	Phase      Phase
 	ReadyItems map[string]string // 已确认存在的副作用项（上次成功写入的状态）
 	Reason     string            // 失败原因（成功时为空）
-	Retriable  bool              // 当前失败是否可重试
-	Attempts   int               // 已尝试次数
-	UpdatedAt  string            // 最近一次成功写入时间（测试可读）
+	// FailureKind 是最近一次失败的机器可分类别
+	// （"Transient"/"InvalidConfig"/"BudgetExhausted"，成功时为空），
+	// 供收敛视图直接区分可恢复失败、配置性问题与预算耗尽。
+	FailureKind string
+	Retriable   bool   // 当前失败是否可重试
+	Attempts    int    // 已尝试次数
+	UpdatedAt   string // 最近一次成功写入时间（测试可读）
 	// ObservedGeneration 是当前状态结论所针对的 Spec.Generation。
 	ObservedGeneration int64
 }

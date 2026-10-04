@@ -140,6 +140,9 @@ func TestCascadeDelete_CleanupRetriableKeepsFinalizer(t *testing.T) {
 // 更新 child。要求：绝不留下无法回收的残留 child；最终全部回收。
 func TestCascadeDelete_RacesWithConcurrentUpdates_NoOrphans(t *testing.T) {
 	clean := &cleanupApplier{}
+	// 前两次 Cleanup 可恢复失败：让级联回收持续若干轮（约 20ms），
+	// 保证并发更新方有足够的竞争窗口，而不是回收瞬间结束、竞争未发生。
+	clean.failUntil.Store(2)
 	owner := readyOwner("owner-3")
 	seed := []*object.Object{owner}
 	for i := 0; i < 6; i++ {

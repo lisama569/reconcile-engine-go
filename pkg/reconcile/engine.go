@@ -14,11 +14,13 @@ import (
 // 同一对象始终被串行协调（由 WorkQueue 去重保证）；
 // 监听 Store 的版本变更通知自动重排队。
 type Engine struct {
-	rec     *Reconciler
-	store   *store.Store
-	queue   *WorkQueue
-	log     *slog.Logger
-	workers int
+	rec        *Reconciler
+	store      *store.Store
+	queue      *WorkQueue
+	tracker    *retryTracker
+	selfWrites *selfWriteLog
+	log        *slog.Logger
+	workers    int
 
 	wg       sync.WaitGroup
 	cancel   context.CancelFunc
@@ -38,6 +40,10 @@ type Config struct {
 	BaseDelay time.Duration
 	MaxDelay  time.Duration
 	Clock     Clock
+	// DefaultRetryBudget 是全局默认重试预算（同一对象连续可恢复失败的
+	// 最大次数，超过即进入"已放弃、需人工介入"状态）；<=0 表示不限。
+	// 单个对象可用 Spec.RetryBudget 覆盖（负数表示该对象不限）。
+	DefaultRetryBudget int
 }
 
 // New 构造引擎（尚未启动）。
@@ -57,22 +63,29 @@ func New(cfg Config) *Engine {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
+	tracker := newRetryTracker()
+	selfWrites := newSelfWriteLog()
 	rec := &Reconciler{
-		Store:     cfg.Store,
-		Apply:     cfg.Applier,
-		Clock:     cfg.Clock,
-		BaseDelay: cfg.BaseDelay,
-		MaxDelay:  cfg.MaxDelay,
-		Log:       cfg.Logger,
+		Store:         cfg.Store,
+		Apply:         cfg.Applier,
+		Clock:         cfg.Clock,
+		BaseDelay:     cfg.BaseDelay,
+		MaxDelay:      cfg.MaxDelay,
+		Log:           cfg.Logger,
+		Tracker:       tracker,
+		DefaultBudget: cfg.DefaultRetryBudget,
+		SelfWrites:    selfWrites,
 	}
 	return &Engine{
-		rec:      rec,
-		store:    cfg.Store,
-		queue:    NewWorkQueue(),
-		log:      cfg.Logger,
-		workers:  cfg.Workers,
-		inflight: map[object.Key]int{},
-		lastSeen: map[object.Key]int64{},
+		rec:        rec,
+		store:      cfg.Store,
+		queue:      NewWorkQueue(),
+		tracker:    tracker,
+		selfWrites: selfWrites,
+		log:        cfg.Logger,
+		workers:    cfg.Workers,
+		inflight:   map[object.Key]int{},
+		lastSeen:   map[object.Key]int64{},
 	}
 }
 
@@ -108,6 +121,11 @@ func (e *Engine) watchNotify(ctx context.Context) {
 			}
 			// 仅当版本比本引擎上次观测更新时才触发，避免自我写入抖动。
 			rv := e.store.Version(k)
+			// 引擎自己的写入（如记录失败状态）产生的通知直接消费跳过：
+			// 否则自写会把刚排好的退避等待折叠成立即重判，破坏逐次变长。
+			if e.selfWrites.consume(k, rv) {
+				continue
+			}
 			e.mu.Lock()
 			seen := e.lastSeen[k]
 			if rv > seen {

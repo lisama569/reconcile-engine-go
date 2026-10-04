@@ -174,6 +174,20 @@ func (q *WorkQueue) Inflight() int {
 	return len(q.working)
 }
 
+// ScheduledAt 返回某键当前排队项的计划取用时间。
+// 这是收敛视图"下一次重试时间"的唯一事实来源：
+// 新触发把延迟项折叠为立即（readyAt 提前）、出队后条目消失，
+// 都直接反映在这里，因此视图永远不会读到已被取消的旧重试计划。
+// 第二个返回值表示该键当前是否在排队（处理中/未排队均为 false）。
+func (q *WorkQueue) ScheduledAt(k object.Key) (time.Time, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if it, ok := q.items[k]; ok {
+		return it.readyAt, true
+	}
+	return time.Time{}, false
+}
+
 // Stop 停止队列，唤醒所有阻塞的 Get。
 func (q *WorkQueue) Stop() {
 	q.mu.Lock()
